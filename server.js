@@ -7,7 +7,7 @@ app.use(express.json({ limit: "10mb" }));
 // in-memory store: freezeId -> { requestBody, response }
 const freezeStore = new Map();
 
-// ---------- helpers ----------
+// ================= shared helpers =================
 
 function isNonEmptyString(v) {
   return typeof v === "string" && v.length > 0;
@@ -35,6 +35,38 @@ function compareUtf8(a, b) {
   return Buffer.compare(ba, bb);
 }
 
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
+
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  if (!aKeys.every((k, i) => k === bKeys[i])) return false;
+  return aKeys.every((k) => deepEqual(a[k], b[k]));
+}
+
+function round12(x) {
+  return Number(x.toFixed(12));
+}
+
+function isFiniteNonNegNumber(v) {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
+
+function isSafeNonNegInt(v) {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0 && Number.isSafeInteger(v);
+}
+
+// ================= FREEZE PHASE =================
+
 function validateCandidateShape(candidate) {
   if (typeof candidate !== "object" || candidate === null) return false;
   if (!isNonEmptyString(candidate.name)) return false;
@@ -47,7 +79,6 @@ function validateCandidateShape(candidate) {
     if (typeof files[k] !== "string") return false;
   }
 
-  // Optional fields, if present must be right type
   if ("loadable" in candidate && typeof candidate.loadable !== "boolean") return false;
   if ("calibrationDigest" in candidate && typeof candidate.calibrationDigest !== "string") return false;
   if ("tokenizerDigest" in candidate && typeof candidate.tokenizerDigest !== "string") return false;
@@ -67,13 +98,12 @@ function validateFreezeRequest(body) {
   const names = new Set();
   for (const c of body.candidates) {
     if (!validateCandidateShape(c)) return false;
-    if (names.has(c.name)) return false; // names must be unique
+    if (names.has(c.name)) return false;
     names.add(c.name);
   }
   return true;
 }
 
-// Build sorted inventory + totalBytes for one candidate's files
 function computeInventory(files) {
   const items = Object.keys(files).map((name) => {
     const bytes = Buffer.from(files[name], "utf8");
@@ -84,10 +114,9 @@ function computeInventory(files) {
   return { inventory: items, totalBytes };
 }
 
-// packageDigest = sha256(utf8(compact JSON of inventory, keys in order name,bytes,sha256))
 function computePackageDigest(inventory) {
   const ordered = inventory.map((i) => ({ name: i.name, bytes: i.bytes, sha256: i.sha256 }));
-  const jsonStr = JSON.stringify(ordered); // compact by default
+  const jsonStr = JSON.stringify(ordered);
   return sha256Hex(Buffer.from(jsonStr, "utf8"));
 }
 
@@ -119,44 +148,12 @@ function buildFreezeResponse(body) {
     const packageDigest = computePackageDigest(inventory);
     const { status, reasonCodes } = decideCandidateStatus(candidate, body);
 
-    return {
-      name: candidate.name,
-      status,
-      inventory,
-      totalBytes,
-      packageDigest,
-      reasonCodes,
-    };
+    return { name: candidate.name, status, inventory, totalBytes, packageDigest, reasonCodes };
   });
 
   results.sort((a, b) => compareUtf8(a.name, b.name));
-
-  return {
-    freezeId: body.freezeId,
-    candidates: results,
-  };
+  return { freezeId: body.freezeId, candidates: results };
 }
-
-// Simple deep equality for detecting "identical replay" vs "conflict"
-function deepEqual(a, b) {
-  if (a === b) return true;
-  if (typeof a !== typeof b) return false;
-  if (typeof a !== "object" || a === null || b === null) return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-
-  if (Array.isArray(a)) {
-    if (a.length !== b.length) return false;
-    return a.every((v, i) => deepEqual(v, b[i]));
-  }
-
-  const aKeys = Object.keys(a).sort();
-  const bKeys = Object.keys(b).sort();
-  if (aKeys.length !== bKeys.length) return false;
-  if (!aKeys.every((k, i) => k === bKeys[i])) return false;
-  return aKeys.every((k) => deepEqual(a[k], b[k]));
-}
-
-// ---------- route handlers ----------
 
 function handleFreeze(body, res) {
   if (!validateFreezeRequest(body)) {
@@ -178,12 +175,249 @@ function handleFreeze(body, res) {
   return res.status(200).json(response);
 }
 
-function handleSelect(body, res) {
-  // TODO: implement Steps 7–13 from the guide
-  return res.status(400).json({ error: "INVALID_INPUT" });
+// ================= SELECT PHASE =================
+
+function validateSelectShape(body) {
+  if (typeof body !== "object" || body === null) return false;
+  if (!isNonEmptyString(body.freezeId)) return false;
+  if (!Array.isArray(body.candidates)) return false;
+  if (!Array.isArray(body.rows)) return false;
+  if (typeof body.policy !== "object" || body.policy === null) return false;
+  return true;
 }
 
-// ---------- express app wiring ----------
+// Recompute totalBytes + packageDigest FROM a candidate's inventory array
+// (never trust the totalBytes/packageDigest fields sent alongside it)
+function recomputeFromInventory(inventory) {
+  if (!Array.isArray(inventory)) return { totalBytes: null, packageDigest: null, ok: false };
+  for (const item of inventory) {
+    if (
+      typeof item !== "object" || item === null ||
+      !isNonEmptyString(item.name) ||
+      !isSafeNonNegInt(item.bytes) ||
+      !isNonEmptyString(item.sha256)
+    ) {
+      return { totalBytes: null, packageDigest: null, ok: false };
+    }
+  }
+  const sorted = [...inventory].sort((a, b) => compareUtf8(a.name, b.name));
+  const totalBytes = sorted.reduce((sum, i) => sum + i.bytes, 0);
+  const packageDigest = computePackageDigest(sorted);
+  return { totalBytes, packageDigest, ok: true };
+}
+
+function validatePolicy(policy, candidateNames) {
+  const codes = [];
+  if (!isSafeNonNegInt(policy.maxBytes)) codes.push("INVALID_POLICY");
+  if (
+    typeof policy.aggregateFloor !== "number" ||
+    !Number.isFinite(policy.aggregateFloor) ||
+    policy.aggregateFloor < 0 ||
+    policy.aggregateFloor > 1
+  ) codes.push("INVALID_POLICY");
+
+  if (typeof policy.requiredSlices !== "object" || policy.requiredSlices === null) {
+    codes.push("INVALID_POLICY");
+  } else {
+    for (const v of Object.values(policy.requiredSlices)) {
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) codes.push("INVALID_POLICY");
+    }
+  }
+
+  if (!isFiniteNonNegNumber(policy.maxLatencyMs)) codes.push("INVALID_POLICY");
+
+  if (!Array.isArray(policy.candidateOrder)) {
+    codes.push("INVALID_POLICY");
+  } else {
+    const orderSet = new Set(policy.candidateOrder);
+    const sameSize = orderSet.size === policy.candidateOrder.length && orderSet.size === candidateNames.size;
+    const sameMembers = sameSize && [...orderSet].every((n) => candidateNames.has(n));
+    if (!sameSize || !sameMembers) codes.push("INVALID_POLICY");
+  }
+
+  return codes.length > 0;
+}
+
+function computeAccuracyForCandidate(candName, rows, requiredSliceNames) {
+  for (const row of rows) {
+    const p = row?.predictions?.[candName];
+    if (p !== 0 && p !== 1) {
+      return { aggregate: null, slices: null, predictionsInvalid: true };
+    }
+  }
+
+  let correct = 0;
+  const sliceCorrect = {};
+  const sliceTotal = {};
+
+  for (const row of rows) {
+    const p = row.predictions[candName];
+    const isMatch = p === row.label ? 1 : 0;
+    correct += isMatch;
+
+    if (requiredSliceNames.has(row.slice)) {
+      sliceCorrect[row.slice] = (sliceCorrect[row.slice] || 0) + isMatch;
+      sliceTotal[row.slice] = (sliceTotal[row.slice] || 0) + 1;
+    }
+  }
+
+  const aggregate = rows.length > 0 ? round12(correct / rows.length) : 0;
+
+  const slices = {};
+  for (const sliceName of requiredSliceNames) {
+    if (sliceTotal[sliceName] > 0) {
+      slices[sliceName] = round12(sliceCorrect[sliceName] / sliceTotal[sliceName]);
+    }
+  }
+
+  return { aggregate, slices, predictionsInvalid: false };
+}
+
+function handleSelect(body, res) {
+  if (!validateSelectShape(body)) {
+    return res.status(400).json({ error: "INVALID_INPUT" });
+  }
+
+  const { freezeId, candidates: submitted, rows, policy } = body;
+  const stored = freezeStore.get(freezeId);
+
+  const submittedNames = new Set(submitted.map((c) => c && c.name));
+  const requiredSliceNames = new Set(
+    policy && typeof policy.requiredSlices === "object" && policy.requiredSlices !== null
+      ? Object.keys(policy.requiredSlices)
+      : []
+  );
+
+  const policyInvalid = !stored ? true : validatePolicy(policy, submittedNames);
+
+  const storedByName = new Map();
+  if (stored) {
+    for (const c of stored.response.candidates) storedByName.set(c.name, c);
+  }
+
+  // Lineage: submitted candidates array must exactly equal the stored response's candidates
+  let lineageOk = false;
+  if (stored) {
+    const sortedSubmitted = [...submitted].sort((a, b) => compareUtf8(a?.name ?? "", b?.name ?? ""));
+    const sortedStored = [...stored.response.candidates].sort((a, b) => compareUtf8(a.name, b.name));
+    lineageOk = deepEqual(sortedSubmitted, sortedStored);
+  }
+
+  const results = submitted.map((cand) => {
+    const name = cand?.name;
+    const codes = new Set();
+
+    const storedCand = storedByName.get(name);
+    const isFrozen = !!storedCand && storedCand.status === "frozen";
+    if (!isFrozen) codes.add("NOT_FROZEN");
+    if (!lineageOk) codes.add("INVALID_LINEAGE");
+    if (policyInvalid) codes.add("INVALID_POLICY");
+
+    const recomputed = recomputeFromInventory(cand?.inventory);
+    if (!recomputed.ok) codes.add("INVALID_MANIFEST");
+
+    const { aggregate, slices, predictionsInvalid } = computeAccuracyForCandidate(
+      name,
+      rows,
+      requiredSliceNames
+    );
+    if (predictionsInvalid) codes.add("INVALID_PREDICTIONS");
+
+    if (!predictionsInvalid && policy && typeof policy.aggregateFloor === "number") {
+      if (aggregate < policy.aggregateFloor) codes.add("AGGREGATE_FLOOR");
+    }
+
+    const outSlices = {};
+    if (!predictionsInvalid) {
+      for (const sliceName of requiredSliceNames) {
+        if (!(sliceName in slices)) {
+          codes.add(`MISSING_SLICE:${sliceName}`);
+        } else {
+          outSlices[sliceName] = slices[sliceName];
+          if (slices[sliceName] < policy.requiredSlices[sliceName]) {
+            codes.add(`SLICE_FLOOR:${sliceName}`);
+          }
+        }
+      }
+    }
+
+    let totalBytes = recomputed.ok ? recomputed.totalBytes : null;
+    if (recomputed.ok && policy && isSafeNonNegInt(policy.maxBytes)) {
+      if (totalBytes > policy.maxBytes) codes.add("SIZE_LIMIT");
+    }
+
+    let latencyMs = null;
+    const rawLatency = body.latencies ? body.latencies[name] : undefined;
+    if (isFiniteNonNegNumber(rawLatency)) {
+      latencyMs = rawLatency;
+      if (policy && isFiniteNonNegNumber(policy.maxLatencyMs) && latencyMs > policy.maxLatencyMs) {
+        codes.add("LATENCY_LIMIT");
+      }
+    } else {
+      codes.add("LATENCY_LIMIT");
+      latencyMs = null;
+    }
+
+    const admitted = codes.size === 0;
+    const sortedCodes = [...codes].sort(compareUtf8);
+
+    return {
+      name,
+      aggregate: predictionsInvalid ? null : aggregate,
+      slices: predictionsInvalid ? null : outSlices,
+      totalBytes,
+      latencyMs,
+      admitted,
+      reasonCodes: sortedCodes,
+      __totalBytesForSort: totalBytes,
+      __latencyForSort: latencyMs,
+    };
+  });
+
+  const orderIndex = new Map();
+  if (Array.isArray(policy?.candidateOrder)) {
+    policy.candidateOrder.forEach((n, i) => orderIndex.set(n, i));
+  }
+  results.sort((a, b) => {
+    const ai = orderIndex.has(a.name) ? orderIndex.get(a.name) : Infinity;
+    const bi = orderIndex.has(b.name) ? orderIndex.get(b.name) : Infinity;
+    if (ai !== bi) return ai - bi;
+    return compareUtf8(a.name, b.name);
+  });
+
+  const admittedResults = results.filter((r) => r.admitted);
+  let winner = null;
+  for (const r of admittedResults) {
+    if (!winner) {
+      winner = r;
+      continue;
+    }
+    if (r.__totalBytesForSort !== winner.__totalBytesForSort) {
+      if (r.__totalBytesForSort < winner.__totalBytesForSort) winner = r;
+      continue;
+    }
+    if (r.__latencyForSort !== winner.__latencyForSort) {
+      if (r.__latencyForSort < winner.__latencyForSort) winner = r;
+      continue;
+    }
+    const rOrder = orderIndex.has(r.name) ? orderIndex.get(r.name) : Infinity;
+    const wOrder = orderIndex.has(winner.name) ? orderIndex.get(winner.name) : Infinity;
+    if (rOrder < wOrder) winner = r;
+  }
+
+  const packageManifest = winner ? storedByName.get(winner.name) ?? null : null;
+
+  const cleanResults = results.map(({ __totalBytesForSort, __latencyForSort, ...rest }) => rest);
+
+  return res.status(200).json({
+    freezeId,
+    selected: winner ? winner.name : null,
+    results: cleanResults,
+    packageManifest,
+  });
+}
+
+// ================= express wiring =================
 
 app.post("/quantize", (req, res) => {
   const body = req.body;
