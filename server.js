@@ -1,4 +1,11 @@
-require("dotenv").config({ path: ".env.local" });
+// Only load .env.local when running locally — Vercel injects env vars directly.
+if (!process.env.VERCEL) {
+  try {
+    require("dotenv").config({ path: ".env.local" });
+  } catch (e) {
+    // dotenv not installed — fine if env vars are already set another way
+  }
+}
 const express = require("express");
 const crypto = require("crypto");
 const { kv } = require("@vercel/kv");
