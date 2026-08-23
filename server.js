@@ -1,11 +1,24 @@
+require("dotenv").config({ path: ".env.local" });
 const express = require("express");
 const crypto = require("crypto");
+const { kv } = require("@vercel/kv");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// in-memory store: freezeId -> { requestBody, response }
-const freezeStore = new Map();
+// ---- persistence layer (Vercel KV instead of in-memory Map) ----
+
+function freezeKey(freezeId) {
+  return `freeze:${freezeId}`;
+}
+
+async function getFreezeRecord(freezeId) {
+  return await kv.get(freezeKey(freezeId)); // returns null if missing
+}
+
+async function setFreezeRecord(freezeId, record) {
+  await kv.set(freezeKey(freezeId), record);
+}
 
 // ================= shared helpers =================
 
@@ -28,7 +41,6 @@ function sha256Hex(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
-// Compare two strings by their raw UTF-8 bytes (not locale-aware sort)
 function compareUtf8(a, b) {
   const ba = Buffer.from(a, "utf8");
   const bb = Buffer.from(b, "utf8");
@@ -155,12 +167,12 @@ function buildFreezeResponse(body) {
   return { freezeId: body.freezeId, candidates: results };
 }
 
-function handleFreeze(body, res) {
+async function handleFreeze(body, res) {
   if (!validateFreezeRequest(body)) {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
-  const existing = freezeStore.get(body.freezeId);
+  const existing = await getFreezeRecord(body.freezeId);
 
   if (existing) {
     if (deepEqual(existing.requestBody, body)) {
@@ -171,7 +183,7 @@ function handleFreeze(body, res) {
   }
 
   const response = buildFreezeResponse(body);
-  freezeStore.set(body.freezeId, { requestBody: body, response });
+  await setFreezeRecord(body.freezeId, { requestBody: body, response });
   return res.status(200).json(response);
 }
 
@@ -186,8 +198,6 @@ function validateSelectShape(body) {
   return true;
 }
 
-// Recompute totalBytes + packageDigest FROM a candidate's inventory array
-// (never trust the totalBytes/packageDigest fields sent alongside it)
 function recomputeFromInventory(inventory) {
   if (!Array.isArray(inventory)) return { totalBytes: null, packageDigest: null, ok: false };
   for (const item of inventory) {
@@ -273,13 +283,13 @@ function computeAccuracyForCandidate(candName, rows, requiredSliceNames) {
   return { aggregate, slices, predictionsInvalid: false };
 }
 
-function handleSelect(body, res) {
+async function handleSelect(body, res) {
   if (!validateSelectShape(body)) {
     return res.status(400).json({ error: "INVALID_INPUT" });
   }
 
   const { freezeId, candidates: submitted, rows, policy } = body;
-  const stored = freezeStore.get(freezeId);
+  const stored = await getFreezeRecord(freezeId);
 
   const submittedNames = new Set(submitted.map((c) => c && c.name));
   const requiredSliceNames = new Set(
@@ -295,7 +305,6 @@ function handleSelect(body, res) {
     for (const c of stored.response.candidates) storedByName.set(c.name, c);
   }
 
-  // Lineage: submitted candidates array must exactly equal the stored response's candidates
   let lineageOk = false;
   if (stored) {
     const sortedSubmitted = [...submitted].sort((a, b) => compareUtf8(a?.name ?? "", b?.name ?? ""));
@@ -419,17 +428,28 @@ function handleSelect(body, res) {
 
 // ================= express wiring =================
 
-app.post("/quantize", (req, res) => {
+app.post("/quantize", async (req, res) => {
   const body = req.body;
 
-  if (body?.phase === "freeze") {
-    return handleFreeze(body, res);
-  } else if (body?.phase === "select") {
-    return handleSelect(body, res);
-  } else {
-    return res.status(400).json({ error: "INVALID_INPUT" });
+  try {
+    if (body?.phase === "freeze") {
+      return await handleFreeze(body, res);
+    } else if (body?.phase === "select") {
+      return await handleSelect(body, res);
+    } else {
+      return res.status(400).json({ error: "INVALID_INPUT" });
+    }
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "INTERNAL_ERROR" });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`listening on port ${PORT}`));
+// Only start a listener when run locally (node server.js).
+// On Vercel, the platform imports `app` directly as a serverless handler.
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`listening on port ${PORT}`));
+}
+
+module.exports = app;
