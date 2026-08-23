@@ -13,6 +13,16 @@ const { kv } = require("@vercel/kv");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
+// If the request body isn't valid JSON, express.json() throws a parse error
+// which Express's default handler turns into an HTML "Bad Request" page.
+// The spec requires a JSON error body in every case, so catch that here.
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "INVALID_INPUT" });
+  }
+  next(err);
+});
+
 // ---- persistence layer (Vercel KV instead of in-memory Map) ----
 
 function freezeKey(freezeId) {
