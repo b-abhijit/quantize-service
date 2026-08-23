@@ -86,24 +86,25 @@ function isSafeNonNegInt(v) {
 
 // ================= FREEZE PHASE =================
 
+// Only the bare minimum needed to accept the request at all: candidate must be
+// an object with a valid, unique, non-empty name. Everything else (files shape,
+// loadable, digests, unsupportedReason) is validated per-candidate later and
+// results in that candidate's status being "invalid" rather than a global 400 —
+// per spec: "If a candidate's files are invalid, return an empty inventory and
+// null totalBytes and packageDigest" (i.e. handled gracefully, not rejected).
 function validateCandidateShape(candidate) {
   if (typeof candidate !== "object" || candidate === null) return false;
   if (!isNonEmptyString(candidate.name)) return false;
+  return true;
+}
 
-  const files = candidate.files;
-  if (typeof files !== "object" || files === null) return false;
+// Files are valid only if: present, a plain object, non-empty, and every
+// value is a string. (Object keys are inherently unique in JS.)
+function candidateFilesValid(files) {
+  if (typeof files !== "object" || files === null || Array.isArray(files)) return false;
   const keys = Object.keys(files);
   if (keys.length === 0) return false;
-  for (const k of keys) {
-    if (typeof files[k] !== "string") return false;
-  }
-
-  if ("loadable" in candidate && typeof candidate.loadable !== "boolean") return false;
-  if ("calibrationDigest" in candidate && typeof candidate.calibrationDigest !== "string") return false;
-  if ("tokenizerDigest" in candidate && typeof candidate.tokenizerDigest !== "string") return false;
-  if ("unsupportedReason" in candidate && typeof candidate.unsupportedReason !== "string") return false;
-
-  return true;
+  return keys.every((k) => typeof files[k] === "string");
 }
 
 function validateFreezeRequest(body) {
@@ -163,6 +164,19 @@ function decideCandidateStatus(candidate, body) {
 
 function buildFreezeResponse(body) {
   const results = body.candidates.map((candidate) => {
+    if (!candidateFilesValid(candidate.files)) {
+      // Per spec: invalid files -> empty inventory, null totals, but the
+      // request as a whole is still accepted.
+      return {
+        name: candidate.name,
+        status: "invalid",
+        inventory: [],
+        totalBytes: null,
+        packageDigest: null,
+        reasonCodes: ["INVALID_INPUT"],
+      };
+    }
+
     const { inventory, totalBytes } = computeInventory(candidate.files);
     const packageDigest = computePackageDigest(inventory);
     const { status, reasonCodes } = decideCandidateStatus(candidate, body);
