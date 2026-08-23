@@ -440,10 +440,17 @@ app.post("/quantize", async (req, res) => {
 
   try {
     if (body?.phase === "freeze") {
+      if (!validateFreezeRequest(body)) {
+        console.log("FREEZE validation failed for body:", JSON.stringify(body));
+      }
       return await handleFreeze(body, res);
     } else if (body?.phase === "select") {
+      if (!validateSelectShape(body)) {
+        console.log("SELECT validation failed for body:", JSON.stringify(body));
+      }
       return await handleSelect(body, res);
     } else {
+      console.log("Unknown/missing phase. Body was:", JSON.stringify(body));
       return res.status(400).json({ error: "INVALID_INPUT" });
     }
   } catch (err) {
